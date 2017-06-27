@@ -1,0 +1,318 @@
+#!/usr/bin/env ruby
+# https://github.com/hanazuki/mackerel-plugin-pdns
+#
+# MIT License
+#
+# Copyright (c) 2017 Kasumi Hanazuki
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+require 'json'
+require 'optparse'
+require 'pathname'
+require 'tmpdir'
+
+class MackerelPlugin
+  class Pdns
+    attr_accessor :control_command, :key_prefix, :label_prefix, :workdir
+
+    def initialize(args)
+      self.control_command = 'pdns_control'
+      self.key_prefix = 'powerdns'
+      self.label_prefix = 'PowerDNS'
+      self.workdir = File.join(ENV.fetch('MACKEREL_PLUGIN_WORKDIR', Dir.tmpdir), 'mackerel-plugin-pdns')
+      opt.parse(args)
+    end
+
+    def run
+      case ENV['MACKEREL_AGENT_PLUGIN_META']
+      when '1'
+        show_meta
+      else
+        time = Time.now.to_i
+        values = fetch_values
+        last_values = load_last_values
+        show_metrics(time, values, last_values)
+        save_last_values(time, values, last_values)
+      end
+    end
+
+    private
+
+    def opt
+      OptionParser.new do |o|
+        o.on('-c', '--control-command PATH', 'path to pdns_control executable (default "pdns_control")', &method(:control_command=))
+        o.on('--metric-key-prefix', &method(:key_prefix=))
+        o.on('--metric-label-prefix', &method(:label_prefix=))
+      end
+    end
+
+    def graphdefs
+      {
+        "#{key_prefix}.dnsupdate" => {
+          label: "#{label_prefix}: Dynamic DNS Update",
+          unit: 'integer',
+          metrics: [
+            {name: 'answers', label: 'Answers'},
+            {name: 'changes', label: 'Changes'},
+            {name: 'queries', label: 'Queries'},
+            {name: 'refused', label: 'Refused'},
+          ],
+        },
+        "#{key_prefix}.notifications" => {
+          label: "#{label_prefix}: DNS Notifications",
+          unit: 'integer',
+          metrics: [
+            {name: 'incoming', label: 'Incoming'},
+          ],
+        },
+        "#{key_prefix}.packetcache" => {
+          label: "#{label_prefix}: Packet Cache",
+          unit: 'integer',
+          metrics: [
+            {name: 'hit', label: 'Hits'},
+            {name: 'miss', label: 'Misses'},
+          ],
+        },
+        "#{key_prefix}.query-cache" => {
+          label: "#{label_prefix}: Query Cache",
+          unit: 'integer',
+          metrics: [
+            {name: 'hit', label: 'Hits'},
+            {name: 'miss', label: 'Misses'},
+          ],
+        },
+        "#{key_prefix}.cache-size" => {
+          label: "#{label_prefix}: Cache Sizes",
+          unit: 'integer',
+          metrics: [
+            {name: 'packetcache', label: 'Packet cache'},
+            {name: 'key', label: 'Key cache'},
+            {name: 'signature', label: 'Signature cache'},
+            {name: 'meta', label: 'Metadata cache'},
+          ],
+        },
+        "#{key_prefix}.servfail" => {
+          label: "#{label_prefix}: SERVFAIL",
+          unit: 'integer',
+          metrics: [
+            {name: 'packets', label: 'SERVFAIL packets'},
+          ],
+        },
+        "#{key_prefix}.signatures" => {
+          label: "#{label_prefix}: DNSSEC Signatures",
+          unit: 'integer',
+          metrics: [
+            {name: 'count', label: 'Signatures created'},
+          ],
+        },
+        "#{key_prefix}.timedout" => {
+          label: "#{label_prefix}: Timedout Packets",
+          unit: 'integer',
+          metrics: [
+            {name: 'packets', label: 'Timedout packets'},
+          ],
+        },
+        "#{key_prefix}.latency" => {
+          label: "#{label_prefix}: Latency (microseconds)",
+          unit: 'integer',
+          metrics: [
+            {name: 'usec', label: 'Latency'},
+          ],
+        },
+        "#{key_prefix}.qsize" => {
+          label: "#{label_prefix}: Queue Size",
+          unit: 'integer',
+          metrics: [
+            {name: 'q', label: 'Queue size'},
+          ],
+        },
+        "#{key_prefix}.answers" => {
+          label: "#{label_prefix}: Answers",
+          unit: 'integer',
+          metrics: [
+            {name: 'tcp', label: 'TCP'},
+            {name: 'udp', label: 'UDP'},
+            {name: 'tcp4', label: 'TCP4', stacked: true},
+            {name: 'udp4', label: 'UDP4', stacked: true},
+            {name: 'tcp6', label: 'TCP6', stacked: true},
+            {name: 'udp6', label: 'UDP6', stacked: true},
+          ],
+        },
+        "#{key_prefix}.queries" => {
+          label: "#{label_prefix}: Queries",
+          unit: 'integer',
+          metrics: [
+            {name: 'tcp', label: 'TCP'},
+            {name: 'udp', label: 'UDP'},
+            {name: 'tcp4', label: 'TCP4', stacked: true},
+            {name: 'udp4', label: 'UDP4', stacked: true},
+            {name: 'tcp6', label: 'TCP6', stacked: true},
+            {name: 'udp6', label: 'UDP6', stacked: true},
+            {name: 'udp-do', label: 'UDP DO queries'},
+          ],
+        },
+        "#{key_prefix}.answer-bytes" => {
+          label: "#{label_prefix}: Answer Bytes",
+          unit: 'bytes',
+          metrics: [
+            {name: 'tcp', label: 'TCP'},
+            {name: 'udp', label: 'UDP'},
+            {name: 'tcp4', label: 'TCP4', stacked: true},
+            {name: 'udp4', label: 'UDP4', stacked: true},
+            {name: 'tcp6', label: 'TCP6', stacked: true},
+            {name: 'udp6', label: 'UDP6', stacked: true},
+          ],
+        },
+        "#{key_prefix}.memory" => {
+          label: "#{label_prefix}: Memory Usage",
+          unit: 'bytes',
+          metrics: [
+            {name: 'usage', label: 'Usage'},
+          ],
+        },
+        "#{key_prefix}.cpu" => {
+          label: "#{label_prefix}: CPU Usage (milliseconds)",
+          unit: 'integer',
+          metrics: [
+            {name: 'user', label: 'User'},
+            {name: 'sys', label: 'System'},
+          ],
+        }
+      }
+    end
+
+    def last_values_file
+      Pathname(workdir).tap(&:mkpath) + 'last'
+    end
+
+    def load_last_values
+      JSON.parse(File.read(last_values_file))
+    rescue Errno::ENOENT
+      {}
+    end
+
+    def save_last_values(time, values, last_values)
+      last_values = values.each.with_object(last_values.dup) do |(k, v), last_values|
+        last_values[k] = {value: v, at: time}
+      end
+      File.write(last_values_file, last_values.to_json)
+    end
+
+    def fetch_values
+      pdns_control('show', '*').chomp.split(?,).each_with_object({}) do |kv, data|
+        k, v = kv.split(?=, 2)
+        data[k] = v.to_i unless k.empty?
+      end
+    end
+
+    def translation
+      {
+#        "corrupt-packets" => {key: "corrupt-packets.count", derive: true},
+#        "deferred-cache-inserts" => {key: "cache.deferred-inserts", derive: true},
+#        "deferred-cache-lookup" => {key: "cache.deferred-lookup", derive: true},
+        "dnsupdate-answers" => {key: "dnsupdate.answers", derive: true},
+        "dnsupdate-changes" => {key: "dnsupdate.changes", derive: true},
+        "dnsupdate-queries" => {key: "dnsupdate.queries", derive: true},
+        "dnsupdate-refused" => {key: "dnsupdate.refused", derive: true},
+        "incoming-notifications" => {key: "notifications.incoming", derive: true},
+        "packetcache-hit" => {key: "packetcache.hit", derive: true},
+        "packetcache-miss" => {key: "packetcache.miss", derive: true},
+        "packetcache-size" => {key: "cache-size.packetcache", derive: false},
+        "query-cache-hit" => {key: "query-cache.hit", derive: true},
+        "query-cache-miss" => {key: "query-cache.miss", derive: true},
+#        "rd-queries" => {key: "rd-queries.count", derive: true},
+#        "recursing-answers" => {key: "recursing.answers", derive: true},
+#        "recursing-questions" => {key: "recursing.questions", derive: true},
+#        "recursion-unanswered" => {key: "recursing.unanswered", derive: true},
+#        "security-status" => nil,
+        "servfail-packets" => {key: "servfail.packets", derive: true},
+        "signatures" => {key: "signatures.count", derive: true},
+        "tcp-answers" => {key: "answers.tcp", derive: true},
+        "tcp-answers-bytes" => {key: "answer-bytes.tcp", derive: true},
+        "tcp-queries" => {key: "queries.tcp", derive: true},
+        "tcp4-answers" => {key: "answers.tcp4", derive: true},
+        "tcp4-answers-bytes" => {key: "answer-bytes.tcp4", derive: true},
+        "tcp4-queries" => {key: "queries.tcp4", derive: true},
+        "tcp6-answers" => {key: "answers.tcp6", derive: true},
+        "tcp6-answers-bytes" => {key: "answer-bytes.tcp6", derive: true},
+        "tcp6-queries" => {key: "queries.tcp6", derive: true},
+        "timedout-packets" => {key: "timedout.packets", derive: true},
+        "udp-answers" => {key: "answers.udp", derive: true},
+        "udp-answers-bytes" => {key: "answer-bytes.udp", derive: true},
+        "udp-do-queries" => {key: "queries.udp-do", derive: true},
+        "udp-queries" => {key: "queries.udp", derive: true},
+        "udp4-answers" => {key: "answers.udp4", derive: true},
+        "udp4-answers-bytes" => {key: "answer-bytes.udp4", derive: true},
+        "udp4-queries" => {key: "queries.udp4", derive: true},
+        "udp6-answers" => {key: "answers.udp6", derive: true},
+        "udp6-answers-bytes" => {key: "answer-bytes.udp6", derive: true},
+        "udp6-queries" => {key: "queries.udp6", derive: true},
+        "key-cache-size" => {key: "cache-size.key", derive: false},
+        "latency" => {key: "latency.usec", derive: false},
+        "meta-cache-size" => {key: "cache-size.meta", derive: false},
+        "qsize-q" => {key: "qsize.q", derive: false},
+        "real-memory-usage" => {key: "memory.usage", derive: false},
+        "signature-cache-size" => {key: "cache-size.signature", derive: false},
+        "sys-msec" => {key: "cpu.sys", derive: true},
+#        "udp-in-errors" => {key: "udp-errors.in", derive: true},
+#        "udp-noport-errors" => {key: "udp-errors.noport", derive: true},
+#        "udp-recvbuf-errors" => {key: "udp-errors.recvbuf", derive: true},
+#        "udp-sndbuf-errors" => {key: "udp-errros.sndbuf", derive: true},
+#        "uptime" => {key: "uptime", derive: false},
+        "user-msec" => {key: "cpu.user", derive: true},
+      }
+    end
+
+    def pdns_control(*args)
+      IO.popen([control_command, *args], 'r', &:read)
+    end
+
+    def show_meta(out = STDOUT)
+      meta = {graphs: graphdefs}
+      out.puts '# mackerel-agent-plugin'
+      out.puts meta.to_json
+    end
+
+    def show_metrics(time, values, last_values, out = STDOUT)
+      values.each do |name, value|
+        next unless tr = translation[name]
+
+        value = calc_diff(time, value, last_values[name]) if tr[:derive]
+        next unless value
+
+        out.puts [[key_prefix, tr[:key]].join(?.), value, time].join(?\t)
+      end
+    end
+
+    def calc_diff(time, value, last_value)
+      return nil unless last_value
+
+      last_time = last_value['at']
+      last_value = last_value['value']
+      return nil unless last_time && last_value
+
+      return nil if time <= last_time || time > last_time + 600
+
+      (value - last_value) * 60.0 / (time - last_time)
+    end
+  end
+end
+
+MackerelPlugin::Pdns.new(ARGV).run
